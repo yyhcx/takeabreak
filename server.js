@@ -18,6 +18,8 @@ const DAILY_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 const PRESENCE_ACTIVE_WINDOW_MS = 2 * 60 * 1000;
 const PRESENCE_CAPACITY = 1500;
 const REDIS_CLICK_TTL_SECONDS = 3 * 24 * 60 * 60;
+const VERCEL_ANALYTICS_SCRIPT_URL = "https://va.vercel-scripts.com/v1/script.js";
+const VERCEL_ANALYTICS_ENDPOINT = "https://vitals.vercel-insights.com/v1";
 const ZHIHU_FALLBACK = {
   links: [
     ["知乎热榜今日快照", "Today", "https://www.zhihu.com/hot"],
@@ -103,16 +105,31 @@ function sendText(res, text, contentType, status = 200) {
   res.end(text);
 }
 
-async function readRequestJson(req) {
+function sendBuffer(res, buffer, contentType, status = 200, extraHeaders = {}) {
+  res.writeHead(status, {
+    "content-type": contentType,
+    "cache-control": "no-store",
+    ...extraHeaders,
+  });
+  res.end(buffer);
+}
+
+async function readRequestBody(req, limitBytes = 64 * 1024) {
   const chunks = [];
+  let size = 0;
   for await (const chunk of req) {
     chunks.push(chunk);
-    if (Buffer.concat(chunks).length > 32 * 1024) {
+    size += chunk.length;
+    if (size > limitBytes) {
       throw new Error("Request body is too large");
     }
   }
 
-  const body = Buffer.concat(chunks).toString("utf8");
+  return Buffer.concat(chunks);
+}
+
+async function readRequestJson(req) {
+  const body = (await readRequestBody(req, 32 * 1024)).toString("utf8");
   return body ? JSON.parse(body) : {};
 }
 
@@ -253,6 +270,82 @@ async function readPresenceStats() {
 async function writePresenceStats(data) {
   await fs.mkdir(DAILY_CACHE_DIR, { recursive: true });
   await fs.writeFile(presenceCachePath(), JSON.stringify(data, null, 2));
+}
+
+function vercelAnalyticsConfig() {
+  const configString = process.env.REACT_APP_VERCEL_OBSERVABILITY_CLIENT_CONFIG;
+  let analytics = {};
+
+  if (configString) {
+    try {
+      analytics = JSON.parse(configString)?.analytics || {};
+    } catch (error) {
+      analytics = {};
+    }
+  }
+
+  return {
+    dsn:
+      analytics.dsn ||
+      process.env.VERCEL_ANALYTICS_DSN ||
+      process.env.NEXT_PUBLIC_VERCEL_ANALYTICS_DSN ||
+      "",
+    basePath:
+      analytics.basePath ||
+      process.env.REACT_APP_VERCEL_OBSERVABILITY_BASEPATH ||
+      "",
+  };
+}
+
+async function serveVercelAnalyticsScript(res) {
+  const response = await fetch(VERCEL_ANALYTICS_SCRIPT_URL);
+  if (!response.ok) {
+    sendText(res, "Not found", "text/plain; charset=utf-8", response.status);
+    return;
+  }
+
+  const script = Buffer.from(await response.arrayBuffer());
+  sendBuffer(res, script, "application/javascript; charset=utf-8", 200, {
+    "cache-control": "public, max-age=86400",
+  });
+}
+
+async function proxyVercelAnalytics(req, res, pathname) {
+  const endpointName = pathname.split("/").pop();
+  if (!["view", "event", "session"].includes(endpointName)) {
+    sendText(res, "Not found", "text/plain; charset=utf-8", 404);
+    return;
+  }
+
+  const target = new URL(`${VERCEL_ANALYTICS_ENDPOINT}/${endpointName}`);
+  const { dsn } = vercelAnalyticsConfig();
+  if (dsn) {
+    target.searchParams.set("dsn", dsn);
+  }
+
+  const body = req.method === "GET" || req.method === "HEAD"
+    ? undefined
+    : await readRequestBody(req);
+
+  const response = await fetch(target, {
+    method: req.method,
+    headers: {
+      "content-type": req.headers["content-type"] || "application/json",
+      "user-agent": req.headers["user-agent"] || "",
+      "x-forwarded-for": req.headers["x-forwarded-for"] || req.socket.remoteAddress || "",
+      "x-vercel-ip": req.headers["x-forwarded-for"] || req.socket.remoteAddress || "",
+      "cookie": req.headers.cookie || "",
+    },
+    body,
+  });
+  const responseBody = Buffer.from(await response.arrayBuffer());
+
+  sendBuffer(
+    res,
+    responseBody,
+    response.headers.get("content-type") || "application/json; charset=utf-8",
+    response.status,
+  );
 }
 
 function normalizeTrackedUrl(value = "") {
@@ -1273,6 +1366,16 @@ async function serveStatic(req, res) {
 async function handleRequest(req, res) {
   try {
     const url = new URL(req.url, `http://${req.headers.host}`);
+
+    if (url.pathname === "/_vercel/insights/script.js") {
+      await serveVercelAnalyticsScript(res);
+      return;
+    }
+
+    if (url.pathname.startsWith("/_vercel/insights/")) {
+      await proxyVercelAnalytics(req, res, url.pathname);
+      return;
+    }
 
     if (url.pathname === "/api/most-clicked-today") {
       sendJson(res, await mostClickedToday());
