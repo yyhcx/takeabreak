@@ -5,6 +5,7 @@ const { URL } = require("node:url");
 
 const PORT = Number(process.env.PORT || 4173);
 const ROOT = __dirname;
+const STATIC_ROOT = process.env.VERCEL ? path.join(ROOT, "public") : ROOT;
 const CACHE_TTL_MS = 5 * 60 * 1000;
 const REQUEST_TIMEOUT_MS = 8000;
 const HN_STORY_LIMIT = 30;
@@ -1042,9 +1043,9 @@ async function huxiuNews() {
 async function serveStatic(req, res) {
   const url = new URL(req.url, `http://${req.headers.host}`);
   const pathname = decodeURIComponent(url.pathname === "/" ? "/index.html" : url.pathname);
-  const filePath = path.resolve(ROOT, `.${pathname}`);
+  const filePath = path.resolve(STATIC_ROOT, `.${pathname}`);
 
-  if (!filePath.startsWith(ROOT)) {
+  if (!filePath.startsWith(STATIC_ROOT)) {
     sendText(res, "Not found", "text/plain; charset=utf-8", 404);
     return;
   }
