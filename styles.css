@@ -829,7 +829,7 @@ a {
   color: #c8d0db;
 }
 
-@media (min-width: 1320px) {
+@media (min-width: 1680px) {
   .hot-grid {
     grid-template-columns: repeat(3, minmax(0, 1fr));
   }
