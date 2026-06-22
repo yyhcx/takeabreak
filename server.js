@@ -15,6 +15,8 @@ const DAILY_CACHE_DIR = process.env.VERCEL
   : path.join(ROOT, ".cache");
 const PERSISTENT_CACHE_MAX_STALE_MS = 7 * 24 * 60 * 60 * 1000;
 const DAILY_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+const PRESENCE_ACTIVE_WINDOW_MS = 2 * 60 * 1000;
+const PRESENCE_CAPACITY = 1500;
 const ZHIHU_FALLBACK = {
   links: [
     ["知乎热榜今日快照", "Today", "https://www.zhihu.com/hot"],
@@ -72,6 +74,7 @@ const HUXIU_FALLBACK = {
 
 const cache = new Map();
 let clickWriteQueue = Promise.resolve();
+let presenceWriteQueue = Promise.resolve();
 
 const mimeTypes = {
   ".html": "text/html; charset=utf-8",
@@ -219,6 +222,10 @@ function clicksCachePath(dateStamp = todayCacheStamp()) {
   return path.join(DAILY_CACHE_DIR, `clicks-${dateStamp}.json`);
 }
 
+function presenceCachePath() {
+  return path.join(DAILY_CACHE_DIR, "presence.json");
+}
+
 async function readClickStats(dateStamp = todayCacheStamp()) {
   try {
     const data = JSON.parse(await fs.readFile(clicksCachePath(dateStamp), "utf8"));
@@ -231,6 +238,20 @@ async function readClickStats(dateStamp = todayCacheStamp()) {
 async function writeClickStats(data) {
   await fs.mkdir(DAILY_CACHE_DIR, { recursive: true });
   await fs.writeFile(clicksCachePath(data.date), JSON.stringify(data, null, 2));
+}
+
+async function readPresenceStats() {
+  try {
+    const data = JSON.parse(await fs.readFile(presenceCachePath(), "utf8"));
+    return data?.visitors ? data : { visitors: {} };
+  } catch (error) {
+    return { visitors: {} };
+  }
+}
+
+async function writePresenceStats(data) {
+  await fs.mkdir(DAILY_CACHE_DIR, { recursive: true });
+  await fs.writeFile(presenceCachePath(), JSON.stringify(data, null, 2));
 }
 
 function normalizeTrackedUrl(value = "") {
@@ -296,6 +317,55 @@ async function mostClickedToday() {
     date: stats.date,
     links: topClickedLinks(stats),
   };
+}
+
+function normalizeVisitorId(value = "") {
+  return String(value).replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 80);
+}
+
+function activePresenceCount(stats, now = Date.now()) {
+  return Object.values(stats.visitors || {}).filter((lastSeenAt) => {
+    return now - Number(lastSeenAt || 0) <= PRESENCE_ACTIVE_WINDOW_MS;
+  }).length;
+}
+
+async function updatePresence(req) {
+  const body = req.method === "POST" ? await readRequestJson(req) : {};
+  const visitorId = normalizeVisitorId(body.visitorId);
+  const isLeaving = body.offline === true;
+  const now = Date.now();
+
+  presenceWriteQueue = presenceWriteQueue.then(async () => {
+    const stats = await readPresenceStats();
+    const visitors = {};
+
+    Object.entries(stats.visitors || {}).forEach(([id, lastSeenAt]) => {
+      if (now - Number(lastSeenAt || 0) <= PRESENCE_ACTIVE_WINDOW_MS) {
+        visitors[id] = Number(lastSeenAt);
+      }
+    });
+
+    if (visitorId && isLeaving) {
+      delete visitors[visitorId];
+    } else if (visitorId) {
+      visitors[visitorId] = now;
+    }
+
+    const nextStats = {
+      updatedAt: now,
+      visitors,
+    };
+    await writePresenceStats(nextStats);
+
+    return {
+      count: activePresenceCount(nextStats, now),
+      capacity: PRESENCE_CAPACITY,
+      activeWindowMs: PRESENCE_ACTIVE_WINDOW_MS,
+      updatedAt: now,
+    };
+  });
+
+  return presenceWriteQueue;
 }
 
 async function dailyCached(key, loader, fallbackData) {
@@ -1070,6 +1140,11 @@ async function handleRequest(req, res) {
     if (url.pathname === "/api/clicks" && req.method === "POST") {
       const data = await recordClick(req);
       sendJson(res, data, data.error ? 400 : 200);
+      return;
+    }
+
+    if (url.pathname === "/api/presence") {
+      sendJson(res, await updatePresence(req));
       return;
     }
 

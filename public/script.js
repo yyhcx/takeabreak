@@ -875,7 +875,7 @@ const hotGrid = document.querySelector("#hot-grid");
 const browsingCount = document.querySelector("#live-browsing-count");
 const browsingMeter = document.querySelector(".meter-progress");
 const BROWSING_CAPACITY = 1500;
-const BROWSING_REFRESH_MS = 90 * 1000;
+const PRESENCE_HEARTBEAT_MS = 30 * 1000;
 
 function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
@@ -899,41 +899,88 @@ function updateBrowsingDisplay(value) {
   updateBrowsingMeter(value);
 }
 
-function createBrowsingEstimate() {
-  const now = new Date();
-  const hours = now.getHours();
-  const minutes = now.getMinutes();
-  const day = now.getDay();
-  const minuteOfDay = hours * 60 + minutes;
-  const dayBias = [24, 48, 72, 88, 80, 46, 30][day] ?? 40;
-  const lunchWave = Math.sin(((minuteOfDay - 780) / 1440) * Math.PI * 2) * 170;
-  const afternoonWave = Math.sin(((minuteOfDay - 930) / 1440) * Math.PI * 4) * 96;
-  const commuterWave = Math.cos(((minuteOfDay - 1080) / 1440) * Math.PI * 2) * 54;
+function getVisitorId() {
+  const storageKey = "takeabreak:visitor-id";
+  try {
+    const existing = localStorage.getItem(storageKey);
+    if (existing) return existing;
 
-  return Math.round(1180 + dayBias + lunchWave + afternoonWave + commuterWave);
+    const id = globalThis.crypto?.randomUUID
+      ? globalThis.crypto.randomUUID()
+      : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+    localStorage.setItem(storageKey, id);
+    return id;
+  } catch (error) {
+    return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+  }
+}
+
+async function syncPresence(visitorId) {
+  const endpoint = location.protocol === "file:" ? `${LOCAL_API_ORIGIN}/api/presence` : "/api/presence";
+  const response = await fetchWithTimeout(endpoint, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({ visitorId }),
+    keepalive: true,
+  });
+
+  if (!response.ok) {
+    throw new Error(`Presence request failed: ${response.status}`);
+  }
+
+  return response.json();
+}
+
+function reportPresenceOffline(visitorId) {
+  const endpoint = location.protocol === "file:" ? `${LOCAL_API_ORIGIN}/api/presence` : "/api/presence";
+  const payload = JSON.stringify({ visitorId, offline: true });
+
+  if (navigator.sendBeacon) {
+    navigator.sendBeacon(endpoint, new Blob([payload], { type: "application/json" }));
+    return;
+  }
+
+  fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+    },
+    body: payload,
+    keepalive: true,
+  }).catch(() => {});
 }
 
 function startBrowsingCounter() {
   if (!browsingCount) return;
 
-  let current = createBrowsingEstimate();
-  updateBrowsingDisplay(current);
+  const visitorId = getVisitorId();
+  let lastKnownCount = 0;
 
-  const tick = () => {
-    const target = createBrowsingEstimate();
-    const variance = Math.round((Math.random() - 0.5) * 52);
-    const drift = Math.round((target - current) * 0.42);
-    current = clamp(current + drift + variance, 1080, 1680);
-    updateBrowsingDisplay(current);
+  const heartbeat = async () => {
+    try {
+      const data = await syncPresence(visitorId);
+      const count = Math.max(0, Number(data.count || 0));
+      lastKnownCount = count;
+      updateBrowsingDisplay(count);
+    } catch (error) {
+      console.warn("Could not update live browsing count", error);
+      updateBrowsingDisplay(lastKnownCount);
+    }
   };
 
-  setInterval(tick, BROWSING_REFRESH_MS);
+  heartbeat();
+  setInterval(heartbeat, PRESENCE_HEARTBEAT_MS);
 
   document.addEventListener("visibilitychange", () => {
     if (!document.hidden) {
-      current = createBrowsingEstimate();
-      updateBrowsingDisplay(current);
+      heartbeat();
     }
+  });
+
+  window.addEventListener("pagehide", () => {
+    reportPresenceOffline(visitorId);
   });
 }
 
