@@ -956,7 +956,7 @@ function startBrowsingCounter() {
   if (!browsingCount) return;
 
   const visitorId = getVisitorId();
-  let lastKnownCount = 0;
+  let lastKnownCount = null;
 
   const heartbeat = async () => {
     try {
@@ -966,7 +966,9 @@ function startBrowsingCounter() {
       updateBrowsingDisplay(count);
     } catch (error) {
       console.warn("Could not update live browsing count", error);
-      updateBrowsingDisplay(lastKnownCount);
+      if (lastKnownCount !== null) {
+        updateBrowsingDisplay(lastKnownCount);
+      }
     }
   };
 
