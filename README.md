@@ -28,6 +28,6 @@ The `api/*.js` files expose the same API routes used locally, while `index.html`
 ## Notes
 
 - Server-side cache uses `.cache/` locally and `/tmp/takeabreak-cache` on Vercel.
-- Vercel's `/tmp` storage is temporary, so "Most clicked today" works as a lightweight demo counter but is not durable across serverless instance resets.
-- For production-grade click rankings, connect a persistent store such as Vercel KV, Upstash Redis, Supabase, or Neon.
+- "Most clicked today" uses Upstash Redis when Redis REST environment variables are available. It automatically checks common Vercel names including `UPSTASH_REDIS_REST_URL`, `KV_REST_API_URL`, and `STORAGE_REST_API_URL`.
+- Vercel's `/tmp` storage is temporary, so if Redis is not connected the click ranking falls back to a lightweight demo counter that is not durable across serverless instance resets.
 - If you want Zhihu's API-based hot list, configure `ZHIHU_COOKIE` in Vercel environment variables. Without it, the app falls back to stable Zhihu links.

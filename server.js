@@ -17,6 +17,7 @@ const PERSISTENT_CACHE_MAX_STALE_MS = 7 * 24 * 60 * 60 * 1000;
 const DAILY_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 const PRESENCE_ACTIVE_WINDOW_MS = 2 * 60 * 1000;
 const PRESENCE_CAPACITY = 1500;
+const REDIS_CLICK_TTL_SECONDS = 3 * 24 * 60 * 60;
 const ZHIHU_FALLBACK = {
   links: [
     ["知乎热榜今日快照", "Today", "https://www.zhihu.com/hot"],
@@ -274,12 +275,141 @@ function topClickedLinks(data) {
     }));
 }
 
+function redisConfig() {
+  const restUrl =
+    process.env.UPSTASH_REDIS_REST_URL ||
+    process.env.KV_REST_API_URL ||
+    process.env.STORAGE_REST_API_URL ||
+    process.env.STORAGE_KV_REST_API_URL ||
+    process.env.STORAGE_URL;
+  const restToken =
+    process.env.UPSTASH_REDIS_REST_TOKEN ||
+    process.env.KV_REST_API_TOKEN ||
+    process.env.STORAGE_REST_API_TOKEN ||
+    process.env.STORAGE_KV_REST_API_TOKEN ||
+    process.env.STORAGE_TOKEN;
+
+  if (!restUrl || !restToken || !/^https?:\/\//i.test(restUrl)) {
+    return null;
+  }
+
+  return {
+    restUrl: restUrl.replace(/\/$/, ""),
+    restToken,
+  };
+}
+
+async function redisCommand(command) {
+  const config = redisConfig();
+  if (!config) {
+    throw new Error("Redis REST environment variables are not configured");
+  }
+
+  const response = await fetch(config.restUrl, {
+    method: "POST",
+    headers: {
+      "authorization": `Bearer ${config.restToken}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify(command),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Redis command failed with ${response.status}`);
+  }
+
+  const data = await response.json();
+  if (data?.error) {
+    throw new Error(data.error);
+  }
+
+  return data?.result;
+}
+
+function redisClickKeys(dateStamp = todayCacheStamp()) {
+  return {
+    rankingKey: `takeabreak:clicks:${dateStamp}`,
+    metaKey: `takeabreak:click-meta:${dateStamp}`,
+  };
+}
+
+function parseClickMeta(value, fallbackUrl) {
+  try {
+    const meta = JSON.parse(value || "{}");
+    return {
+      title: String(meta.title || fallbackUrl),
+      url: normalizeTrackedUrl(meta.url) || fallbackUrl,
+    };
+  } catch (error) {
+    return {
+      title: fallbackUrl,
+      url: fallbackUrl,
+    };
+  }
+}
+
+async function redisTopClickedLinks(dateStamp = todayCacheStamp()) {
+  const { rankingKey, metaKey } = redisClickKeys(dateStamp);
+  const ranked = await redisCommand(["ZREVRANGE", rankingKey, 0, 4, "WITHSCORES"]);
+  if (!Array.isArray(ranked) || !ranked.length) {
+    return [];
+  }
+
+  const entries = [];
+  for (let index = 0; index < ranked.length; index += 2) {
+    const url = String(ranked[index] || "");
+    const count = Number(ranked[index + 1] || 0);
+    if (url) {
+      entries.push({ url, count });
+    }
+  }
+
+  if (!entries.length) {
+    return [];
+  }
+
+  const metaValues = await redisCommand(["HMGET", metaKey, ...entries.map((entry) => entry.url)]);
+  return entries.map((entry, index) => {
+    const meta = parseClickMeta(Array.isArray(metaValues) ? metaValues[index] : "", entry.url);
+    return {
+      title: meta.title,
+      url: meta.url,
+      count: entry.count,
+    };
+  });
+}
+
+async function recordClickInRedis(title, url) {
+  const date = todayCacheStamp();
+  const { rankingKey, metaKey } = redisClickKeys(date);
+  const metadata = JSON.stringify({ title, url });
+
+  await redisCommand(["ZINCRBY", rankingKey, 1, url]);
+  await redisCommand(["HSET", metaKey, url, metadata]);
+  await redisCommand(["EXPIRE", rankingKey, REDIS_CLICK_TTL_SECONDS]);
+  await redisCommand(["EXPIRE", metaKey, REDIS_CLICK_TTL_SECONDS]);
+
+  return {
+    date,
+    links: await redisTopClickedLinks(date),
+    storage: "redis",
+  };
+}
+
 async function recordClick(req) {
   const body = await readRequestJson(req);
   const title = stripTags(String(body.title || "")).slice(0, 180);
   const url = normalizeTrackedUrl(body.url);
   if (!title || !url) {
     return { error: "Invalid click payload" };
+  }
+
+  if (redisConfig()) {
+    try {
+      return await recordClickInRedis(title, url);
+    } catch (error) {
+      console.warn("Redis click tracking failed; falling back to local cache", error);
+    }
   }
 
   clickWriteQueue = clickWriteQueue.then(async () => {
@@ -312,6 +442,18 @@ async function recordClick(req) {
 }
 
 async function mostClickedToday() {
+  if (redisConfig()) {
+    try {
+      return {
+        date: todayCacheStamp(),
+        links: await redisTopClickedLinks(),
+        storage: "redis",
+      };
+    } catch (error) {
+      console.warn("Redis top clicked lookup failed; falling back to local cache", error);
+    }
+  }
+
   const stats = await readClickStats();
   return {
     date: stats.date,
