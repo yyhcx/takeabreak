@@ -183,13 +183,23 @@ async function fetchUrl(url, responseType = "text", timeoutMs = REQUEST_TIMEOUT_
   }
 }
 
-function todayCacheStamp() {
+function cacheStampForDate(date = new Date()) {
   return new Intl.DateTimeFormat("en-CA", {
     timeZone: "Asia/Shanghai",
     year: "numeric",
     month: "2-digit",
     day: "2-digit",
-  }).format(new Date());
+  }).format(date);
+}
+
+function todayCacheStamp() {
+  return cacheStampForDate();
+}
+
+function cacheStampDaysAgo(daysAgo = 0) {
+  const date = new Date();
+  date.setUTCDate(date.getUTCDate() - Number(daysAgo || 0));
+  return cacheStampForDate(date);
 }
 
 async function readDailyCache(key) {
@@ -686,16 +696,59 @@ async function recordMetrics(req) {
   return metricsWriteQueue;
 }
 
-async function metricsSummary() {
+function aggregateMetricSummaries(summaries = []) {
+  const sourceMap = new Map();
+  const totals = {
+    pageViews: 0,
+    sourceImpressions: 0,
+    linkClicks: 0,
+  };
+
+  summaries.forEach((summary) => {
+    totals.pageViews += Number(summary.totals?.pageViews || 0);
+    totals.sourceImpressions += Number(summary.totals?.sourceImpressions || 0);
+    totals.linkClicks += Number(summary.totals?.linkClicks || 0);
+
+    (summary.sources || []).forEach((source) => {
+      const key = source.key || source.name;
+      if (!key) return;
+      const existing = sourceMap.get(key) || {
+        key,
+        name: source.name || key,
+        index: source.index || "",
+        impressions: 0,
+        clicks: 0,
+      };
+
+      existing.name = source.name || existing.name;
+      existing.index = source.index || existing.index;
+      existing.impressions += Number(source.impressions || 0);
+      existing.clicks += Number(source.clicks || 0);
+      sourceMap.set(key, existing);
+    });
+  });
+
+  return {
+    totals,
+    sources: [...sourceMap.values()]
+      .map((item) => ({
+        ...item,
+        ctr: item.impressions ? Number((item.clicks / item.impressions).toFixed(4)) : 0,
+      }))
+      .sort((a, b) => b.clicks - a.clicks || b.impressions - a.impressions || a.name.localeCompare(b.name)),
+  };
+}
+
+async function metricsSummary(dateStamp = todayCacheStamp()) {
   if (redisConfig()) {
     try {
-      return await redisSourceMetrics();
+      return await redisSourceMetrics(dateStamp);
     } catch (error) {
       console.warn("Redis metrics lookup failed; falling back to local cache", error);
     }
   }
 
-  const stats = await readMetricStats();
+  const stats = await readMetricStats(dateStamp);
   return {
     date: stats.date,
     totals: stats.totals,
@@ -705,6 +758,29 @@ async function metricsSummary() {
         ctr: item.impressions ? Number((item.clicks / item.impressions).toFixed(4)) : 0,
       }))
       .sort((a, b) => b.clicks - a.clicks || b.impressions - a.impressions || a.name.localeCompare(b.name)),
+  };
+}
+
+async function metricsRange(days = 7) {
+  const boundedDays = Math.max(1, Math.min(30, Number(days) || 7));
+  const dates = Array.from({ length: boundedDays }, (_, index) => cacheStampDaysAgo(index));
+  const daily = await Promise.all(dates.map((dateStamp) => metricsSummary(dateStamp)));
+  const orderedDaily = daily.reverse();
+  const aggregate = aggregateMetricSummaries(orderedDaily);
+
+  return {
+    days: boundedDays,
+    storage: redisConfig() ? "redis" : "local",
+    dateRange: {
+      from: orderedDaily[0]?.date || todayCacheStamp(),
+      to: orderedDaily[orderedDaily.length - 1]?.date || todayCacheStamp(),
+    },
+    totals: aggregate.totals,
+    sources: aggregate.sources,
+    daily: orderedDaily.map((summary) => ({
+      date: summary.date,
+      totals: summary.totals,
+    })),
   };
 }
 
@@ -1662,6 +1738,12 @@ async function serveStatic(req, res) {
   }
 }
 
+async function serveDashboard(res) {
+  const filePath = path.join(ROOT, "dashboard.html");
+  const content = await fs.readFile(filePath);
+  sendText(res, content, "text/html; charset=utf-8");
+}
+
 async function handleRequest(req, res) {
   try {
     const url = new URL(req.url, `http://${req.headers.host}`);
@@ -1673,6 +1755,11 @@ async function handleRequest(req, res) {
 
     if (url.pathname.startsWith("/_vercel/insights/")) {
       await proxyVercelAnalytics(req, res, url.pathname);
+      return;
+    }
+
+    if (url.pathname === "/api/dashboard") {
+      await serveDashboard(res);
       return;
     }
 
@@ -1694,7 +1781,8 @@ async function handleRequest(req, res) {
         return;
       }
 
-      sendJson(res, await metricsSummary());
+      const days = Number(url.searchParams.get("days") || 1);
+      sendJson(res, days > 1 ? await metricsRange(days) : await metricsSummary());
       return;
     }
 
