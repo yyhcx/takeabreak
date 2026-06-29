@@ -268,12 +268,12 @@ function escapeAttribute(value = "") {
     .replace(/>/g, "&gt;");
 }
 
-function itemTemplate(item, index) {
+function itemTemplate(item, index, source = {}, sourceIndex = "") {
   const [title, count, url] = item;
   const href = url ?? `https://example.com/${encodeURIComponent(title.toLowerCase().replaceAll(" ", "-"))}`;
   return `
     <li>
-      <a href="${href}" target="_blank" rel="noreferrer" data-track-click="true" data-click-title="${escapeAttribute(title)}" data-click-url="${escapeAttribute(href)}">
+      <a href="${href}" target="_blank" rel="noreferrer" data-track-click="true" data-click-title="${escapeAttribute(title)}" data-click-url="${escapeAttribute(href)}" data-click-source="${escapeAttribute(source.name || "")}" data-click-source-index="${escapeAttribute(sourceIndex)}" data-click-link-index="${index}">
         <span class="rank">${index + 1}</span>
         <span class="link-title"><span>${title}</span></span>
         <span class="count">${count}</span>
@@ -284,11 +284,11 @@ function itemTemplate(item, index) {
 
 function compactPairTemplate(source, index) {
   return `
-    <article class="hot-card compact-pair-card" data-source-index="${index}" style="--source: ${source.color}">
+    <article class="hot-card compact-pair-card" data-source-index="${index}" data-source-name="${escapeAttribute(source.name)}" style="--source: ${source.color}">
       ${source.items.map((item) => {
         const [title, count, url] = item.link;
         return `
-          <a class="compact-source" href="${url}" target="_blank" rel="noreferrer" data-track-click="true" data-click-title="${escapeAttribute(title)}" data-click-url="${escapeAttribute(url)}" style="--source: ${item.color}">
+          <a class="compact-source" href="${url}" target="_blank" rel="noreferrer" data-track-click="true" data-click-title="${escapeAttribute(title)}" data-click-url="${escapeAttribute(url)}" data-click-source="${escapeAttribute(item.name)}" data-click-source-index="${escapeAttribute(index)}" style="--source: ${item.color}">
             <div class="compact-source-head">
               <span class="source-icon">${iconSvg(item.icon)}</span>
               <div class="source-title">
@@ -313,7 +313,7 @@ function cardTemplate(source, index) {
   }
 
   return `
-    <article class="hot-card" data-source-index="${index}" style="--source: ${source.color}">
+    <article class="hot-card" data-source-index="${index}" data-source-name="${escapeAttribute(source.name)}" style="--source: ${source.color}">
       <div class="card-head">
         <span class="source-icon">${iconSvg(source.icon)}</span>
         <div class="source-title">
@@ -328,7 +328,7 @@ function cardTemplate(source, index) {
         </button>
       </div>
       <ol class="links">
-        ${source.links.map(itemTemplate).join("")}
+        ${source.links.map((item, itemIndex) => itemTemplate(item, itemIndex, source, index)).join("")}
       </ol>
     </article>
   `;
@@ -368,7 +368,7 @@ function renderMostClicked() {
   .map(({ title, count, url }, index) => {
     return `
       <li>
-        <a href="${url}" target="_blank" rel="noreferrer" data-track-click="true" data-click-title="${escapeAttribute(title)}" data-click-url="${escapeAttribute(url)}">
+        <a href="${url}" target="_blank" rel="noreferrer" data-track-click="true" data-click-title="${escapeAttribute(title)}" data-click-url="${escapeAttribute(url)}" data-click-source="Most clicked today" data-click-source-index="side-most-clicked">
           <span class="rank">${index + 1}</span>
           <span class="click-title">${title}</span>
           <span class="count">${count}</span>
@@ -496,9 +496,50 @@ async function loadMostClickedToday() {
   }
 }
 
+function metricsEndpoint() {
+  return location.protocol === "file:" ? `${LOCAL_API_ORIGIN}/api/metrics` : "/api/metrics";
+}
+
+function reportMetric(type, payload = {}) {
+  const event = {
+    type,
+    path: location.pathname || "/",
+    referrer: document.referrer || "",
+    viewportWidth: window.innerWidth,
+    viewportHeight: window.innerHeight,
+    ...payload,
+  };
+  const body = JSON.stringify(event);
+  const endpoint = metricsEndpoint();
+
+  if (navigator.sendBeacon) {
+    navigator.sendBeacon(endpoint, new Blob([body], { type: "application/json" }));
+    return;
+  }
+
+  fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+    },
+    body,
+    keepalive: true,
+  }).catch((error) => console.warn("Could not report metric", error));
+}
+
+function sourceMetaFromAnchor(anchor) {
+  const card = anchor.closest("[data-source-index]");
+  return {
+    sourceName: anchor.dataset.clickSource || card?.dataset.sourceName || "",
+    sourceIndex: anchor.dataset.clickSourceIndex || card?.dataset.sourceIndex || "",
+    linkIndex: anchor.dataset.clickLinkIndex || "",
+  };
+}
+
 function reportLinkClick(anchor) {
   const title = anchor.dataset.clickTitle || anchor.textContent.trim();
   const url = anchor.dataset.clickUrl || anchor.href;
+  const sourceMeta = sourceMetaFromAnchor(anchor);
   if (!title || !url) return;
 
   const endpoint = location.protocol === "file:" ? `${LOCAL_API_ORIGIN}/api/clicks` : "/api/clicks";
@@ -507,7 +548,7 @@ function reportLinkClick(anchor) {
     headers: {
       "content-type": "application/json",
     },
-    body: JSON.stringify({ title, url }),
+    body: JSON.stringify({ title, url, ...sourceMeta }),
     keepalive: true,
   })
     .then(() => loadMostClickedToday())
@@ -876,6 +917,74 @@ const browsingCount = document.querySelector("#live-browsing-count");
 const browsingMeter = document.querySelector(".meter-progress");
 const BROWSING_CAPACITY = 1500;
 const PRESENCE_HEARTBEAT_MS = 30 * 1000;
+
+function readSessionSet(key) {
+  try {
+    return new Set(JSON.parse(sessionStorage.getItem(key) || "[]"));
+  } catch (error) {
+    return new Set();
+  }
+}
+
+function writeSessionSet(key, values) {
+  try {
+    sessionStorage.setItem(key, JSON.stringify([...values]));
+  } catch (error) {
+    // Session storage can be unavailable in private browsing; metrics still work without dedupe.
+  }
+}
+
+const SOURCE_IMPRESSION_SESSION_KEY = "takeabreak:source-impressions";
+const seenSourceImpressions = readSessionSet(SOURCE_IMPRESSION_SESSION_KEY);
+
+function sourceImpressionKey(card) {
+  return `${card.dataset.sourceIndex || ""}:${card.dataset.sourceName || ""}`;
+}
+
+function reportSourceImpression(card) {
+  const key = sourceImpressionKey(card);
+  if (!key || seenSourceImpressions.has(key)) return;
+
+  seenSourceImpressions.add(key);
+  writeSessionSet(SOURCE_IMPRESSION_SESSION_KEY, seenSourceImpressions);
+  reportMetric("source_impression", {
+    sourceName: card.dataset.sourceName || "",
+    sourceIndex: card.dataset.sourceIndex || "",
+  });
+}
+
+function startSourceImpressionTracking() {
+  if (!hotGrid) return;
+
+  if (!("IntersectionObserver" in window)) {
+    hotGrid.querySelectorAll(".hot-card[data-source-index]").forEach(reportSourceImpression);
+    return;
+  }
+
+  const observer = new IntersectionObserver((entries) => {
+    entries.forEach((entry) => {
+      if (!entry.isIntersecting) return;
+      reportSourceImpression(entry.target);
+      observer.unobserve(entry.target);
+    });
+  }, {
+    threshold: 0.45,
+  });
+
+  const observeCards = () => {
+    hotGrid.querySelectorAll(".hot-card[data-source-index]").forEach((card) => {
+      if (!seenSourceImpressions.has(sourceImpressionKey(card))) {
+        observer.observe(card);
+      }
+    });
+  };
+
+  observeCards();
+  new MutationObserver(observeCards).observe(hotGrid, { childList: true });
+}
+
+reportMetric("page_view");
+startSourceImpressionTracking();
 
 function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));

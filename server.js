@@ -18,6 +18,7 @@ const DAILY_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 const PRESENCE_ACTIVE_WINDOW_MS = 2 * 60 * 1000;
 const PRESENCE_CAPACITY = 1500;
 const REDIS_CLICK_TTL_SECONDS = 3 * 24 * 60 * 60;
+const REDIS_METRIC_TTL_SECONDS = 30 * 24 * 60 * 60;
 const VERCEL_ANALYTICS_SCRIPT_URL = "https://va.vercel-scripts.com/v1/script.js";
 const VERCEL_ANALYTICS_ENDPOINT = "https://vitals.vercel-insights.com/v1";
 const ZHIHU_FALLBACK = {
@@ -78,6 +79,7 @@ const HUXIU_FALLBACK = {
 const cache = new Map();
 let clickWriteQueue = Promise.resolve();
 let presenceWriteQueue = Promise.resolve();
+let metricsWriteQueue = Promise.resolve();
 
 const mimeTypes = {
   ".html": "text/html; charset=utf-8",
@@ -240,6 +242,10 @@ function clicksCachePath(dateStamp = todayCacheStamp()) {
   return path.join(DAILY_CACHE_DIR, `clicks-${dateStamp}.json`);
 }
 
+function metricsCachePath(dateStamp = todayCacheStamp()) {
+  return path.join(DAILY_CACHE_DIR, `metrics-${dateStamp}.json`);
+}
+
 function presenceCachePath() {
   return path.join(DAILY_CACHE_DIR, "presence.json");
 }
@@ -256,6 +262,32 @@ async function readClickStats(dateStamp = todayCacheStamp()) {
 async function writeClickStats(data) {
   await fs.mkdir(DAILY_CACHE_DIR, { recursive: true });
   await fs.writeFile(clicksCachePath(data.date), JSON.stringify(data, null, 2));
+}
+
+function emptyMetrics(dateStamp = todayCacheStamp()) {
+  return {
+    date: dateStamp,
+    totals: {
+      pageViews: 0,
+      sourceImpressions: 0,
+      linkClicks: 0,
+    },
+    sources: {},
+  };
+}
+
+async function readMetricStats(dateStamp = todayCacheStamp()) {
+  try {
+    const data = JSON.parse(await fs.readFile(metricsCachePath(dateStamp), "utf8"));
+    return data?.date === dateStamp && data?.sources ? data : emptyMetrics(dateStamp);
+  } catch (error) {
+    return emptyMetrics(dateStamp);
+  }
+}
+
+async function writeMetricStats(data) {
+  await fs.mkdir(DAILY_CACHE_DIR, { recursive: true });
+  await fs.writeFile(metricsCachePath(data.date), JSON.stringify(data, null, 2));
 }
 
 async function readPresenceStats() {
@@ -426,6 +458,256 @@ function redisClickKeys(dateStamp = todayCacheStamp()) {
   };
 }
 
+function redisMetricKeys(dateStamp = todayCacheStamp()) {
+  return {
+    totalsKey: `takeabreak:metrics:totals:${dateStamp}`,
+    sourceImpressionsKey: `takeabreak:metrics:source-impressions:${dateStamp}`,
+    sourceClicksKey: `takeabreak:metrics:source-clicks:${dateStamp}`,
+    sourceMetaKey: `takeabreak:metrics:source-meta:${dateStamp}`,
+  };
+}
+
+function sanitizeMetricText(value = "", maxLength = 120) {
+  return stripTags(String(value || "")).slice(0, maxLength);
+}
+
+function normalizeMetricEvent(rawEvent = {}) {
+  const type = sanitizeMetricText(rawEvent.type, 40);
+  if (!["page_view", "source_impression", "link_click"].includes(type)) {
+    return null;
+  }
+
+  return {
+    type,
+    sourceName: sanitizeMetricText(rawEvent.sourceName, 100),
+    sourceIndex: sanitizeMetricText(rawEvent.sourceIndex, 24),
+    path: sanitizeMetricText(rawEvent.path, 180),
+    referrer: sanitizeMetricText(rawEvent.referrer, 240),
+    viewportWidth: Number(rawEvent.viewportWidth || 0),
+    viewportHeight: Number(rawEvent.viewportHeight || 0),
+  };
+}
+
+function metricSourceKey(event) {
+  const sourceName = sanitizeMetricText(event.sourceName, 100);
+  const sourceIndex = sanitizeMetricText(event.sourceIndex, 24);
+  if (sourceName) return sourceName;
+  if (sourceIndex) return `source-${sourceIndex}`;
+  return "";
+}
+
+function sourceMetricSummary(impressions = [], clicks = [], metaValues = []) {
+  const map = new Map();
+
+  for (let index = 0; index < impressions.length; index += 2) {
+    const key = String(impressions[index] || "");
+    if (!key) continue;
+    map.set(key, {
+      key,
+      impressions: Number(impressions[index + 1] || 0),
+      clicks: 0,
+    });
+  }
+
+  for (let index = 0; index < clicks.length; index += 2) {
+    const key = String(clicks[index] || "");
+    if (!key) continue;
+    const existing = map.get(key) || { key, impressions: 0, clicks: 0 };
+    existing.clicks = Number(clicks[index + 1] || 0);
+    map.set(key, existing);
+  }
+
+  const keys = [...map.keys()];
+  keys.forEach((key, index) => {
+    try {
+      const meta = JSON.parse(Array.isArray(metaValues) ? metaValues[index] || "{}" : "{}");
+      const existing = map.get(key);
+      existing.name = sanitizeMetricText(meta.name || key, 100);
+      existing.index = sanitizeMetricText(meta.index, 24);
+    } catch (error) {
+      const existing = map.get(key);
+      existing.name = key;
+      existing.index = "";
+    }
+  });
+
+  return [...map.values()]
+    .map((item) => ({
+      ...item,
+      ctr: item.impressions ? Number((item.clicks / item.impressions).toFixed(4)) : 0,
+    }))
+    .sort((a, b) => b.clicks - a.clicks || b.impressions - a.impressions || a.name.localeCompare(b.name));
+}
+
+async function redisSourceMetrics(dateStamp = todayCacheStamp()) {
+  const { totalsKey, sourceImpressionsKey, sourceClicksKey, sourceMetaKey } = redisMetricKeys(dateStamp);
+  const totals = await redisCommand(["HMGET", totalsKey, "pageViews", "sourceImpressions", "linkClicks"]);
+  const impressions = await redisCommand(["ZREVRANGE", sourceImpressionsKey, 0, -1, "WITHSCORES"]);
+  const clicks = await redisCommand(["ZREVRANGE", sourceClicksKey, 0, -1, "WITHSCORES"]);
+  const keys = [...new Set([
+    ...(Array.isArray(impressions) ? impressions.filter((_, index) => index % 2 === 0) : []),
+    ...(Array.isArray(clicks) ? clicks.filter((_, index) => index % 2 === 0) : []),
+  ])];
+  const metaValues = keys.length ? await redisCommand(["HMGET", sourceMetaKey, ...keys]) : [];
+
+  return {
+    date: dateStamp,
+    storage: "redis",
+    totals: {
+      pageViews: Number(totals?.[0] || 0),
+      sourceImpressions: Number(totals?.[1] || 0),
+      linkClicks: Number(totals?.[2] || 0),
+    },
+    sources: sourceMetricSummary(
+      Array.isArray(impressions) ? impressions : [],
+      Array.isArray(clicks) ? clicks : [],
+      keys.map((_, index) => Array.isArray(metaValues) ? metaValues[index] : ""),
+    ),
+  };
+}
+
+async function recordMetricInRedis(event) {
+  const date = todayCacheStamp();
+  const { totalsKey, sourceImpressionsKey, sourceClicksKey, sourceMetaKey } = redisMetricKeys(date);
+  const sourceKey = metricSourceKey(event);
+
+  if (event.type === "page_view") {
+    await redisCommand(["HINCRBY", totalsKey, "pageViews", 1]);
+  }
+
+  if (event.type === "source_impression" && sourceKey) {
+    await redisCommand(["HINCRBY", totalsKey, "sourceImpressions", 1]);
+    await redisCommand(["ZINCRBY", sourceImpressionsKey, 1, sourceKey]);
+    await redisCommand(["HSET", sourceMetaKey, sourceKey, JSON.stringify({
+      name: event.sourceName || sourceKey,
+      index: event.sourceIndex || "",
+    })]);
+  }
+
+  if (event.type === "link_click" && sourceKey) {
+    await redisCommand(["HINCRBY", totalsKey, "linkClicks", 1]);
+    await redisCommand(["ZINCRBY", sourceClicksKey, 1, sourceKey]);
+    await redisCommand(["HSET", sourceMetaKey, sourceKey, JSON.stringify({
+      name: event.sourceName || sourceKey,
+      index: event.sourceIndex || "",
+    })]);
+  }
+
+  await Promise.all([
+    redisCommand(["EXPIRE", totalsKey, REDIS_METRIC_TTL_SECONDS]),
+    redisCommand(["EXPIRE", sourceImpressionsKey, REDIS_METRIC_TTL_SECONDS]),
+    redisCommand(["EXPIRE", sourceClicksKey, REDIS_METRIC_TTL_SECONDS]),
+    redisCommand(["EXPIRE", sourceMetaKey, REDIS_METRIC_TTL_SECONDS]),
+  ]);
+
+  return { date, storage: "redis" };
+}
+
+function applyMetricEvent(stats, event) {
+  const sourceKey = metricSourceKey(event);
+
+  if (event.type === "page_view") {
+    stats.totals.pageViews = Number(stats.totals.pageViews || 0) + 1;
+  }
+
+  if (event.type === "source_impression" && sourceKey) {
+    stats.totals.sourceImpressions = Number(stats.totals.sourceImpressions || 0) + 1;
+    const existing = stats.sources[sourceKey] || {
+      key: sourceKey,
+      name: event.sourceName || sourceKey,
+      index: event.sourceIndex || "",
+      impressions: 0,
+      clicks: 0,
+    };
+    stats.sources[sourceKey] = {
+      ...existing,
+      name: event.sourceName || existing.name,
+      index: event.sourceIndex || existing.index,
+      impressions: Number(existing.impressions || 0) + 1,
+      lastSeenAt: Date.now(),
+    };
+  }
+
+  if (event.type === "link_click" && sourceKey) {
+    stats.totals.linkClicks = Number(stats.totals.linkClicks || 0) + 1;
+    const existing = stats.sources[sourceKey] || {
+      key: sourceKey,
+      name: event.sourceName || sourceKey,
+      index: event.sourceIndex || "",
+      impressions: 0,
+      clicks: 0,
+    };
+    stats.sources[sourceKey] = {
+      ...existing,
+      name: event.sourceName || existing.name,
+      index: event.sourceIndex || existing.index,
+      clicks: Number(existing.clicks || 0) + 1,
+      lastClickedAt: Date.now(),
+    };
+  }
+
+  return stats;
+}
+
+async function recordMetrics(req) {
+  const body = await readRequestJson(req);
+  const events = Array.isArray(body.events) ? body.events : [body];
+  const normalizedEvents = events.map(normalizeMetricEvent).filter(Boolean).slice(0, 20);
+
+  if (!normalizedEvents.length) {
+    return { error: "Invalid metrics payload" };
+  }
+
+  if (redisConfig()) {
+    try {
+      for (const event of normalizedEvents) {
+        await recordMetricInRedis(event);
+      }
+      return {
+        date: todayCacheStamp(),
+        accepted: normalizedEvents.length,
+        storage: "redis",
+      };
+    } catch (error) {
+      console.warn("Redis metrics tracking failed; falling back to local cache", error);
+    }
+  }
+
+  metricsWriteQueue = metricsWriteQueue.then(async () => {
+    const stats = await readMetricStats();
+    normalizedEvents.forEach((event) => applyMetricEvent(stats, event));
+    await writeMetricStats(stats);
+    return {
+      date: stats.date,
+      accepted: normalizedEvents.length,
+    };
+  });
+
+  return metricsWriteQueue;
+}
+
+async function metricsSummary() {
+  if (redisConfig()) {
+    try {
+      return await redisSourceMetrics();
+    } catch (error) {
+      console.warn("Redis metrics lookup failed; falling back to local cache", error);
+    }
+  }
+
+  const stats = await readMetricStats();
+  return {
+    date: stats.date,
+    totals: stats.totals,
+    sources: Object.values(stats.sources || {})
+      .map((item) => ({
+        ...item,
+        ctr: item.impressions ? Number((item.clicks / item.impressions).toFixed(4)) : 0,
+      }))
+      .sort((a, b) => b.clicks - a.clicks || b.impressions - a.impressions || a.name.localeCompare(b.name)),
+  };
+}
+
 function parseClickMeta(value, fallbackUrl) {
   try {
     const meta = JSON.parse(value || "{}");
@@ -472,7 +754,7 @@ async function redisTopClickedLinks(dateStamp = todayCacheStamp()) {
   });
 }
 
-async function recordClickInRedis(title, url) {
+async function recordClickInRedis(title, url, metricEvent = null) {
   const date = todayCacheStamp();
   const { rankingKey, metaKey } = redisClickKeys(date);
   const metadata = JSON.stringify({ title, url });
@@ -481,6 +763,13 @@ async function recordClickInRedis(title, url) {
   await redisCommand(["HSET", metaKey, url, metadata]);
   await redisCommand(["EXPIRE", rankingKey, REDIS_CLICK_TTL_SECONDS]);
   await redisCommand(["EXPIRE", metaKey, REDIS_CLICK_TTL_SECONDS]);
+  if (metricEvent) {
+    try {
+      await recordMetricInRedis(metricEvent);
+    } catch (error) {
+      console.warn("Redis click metric tracking failed", error);
+    }
+  }
 
   return {
     date,
@@ -493,13 +782,18 @@ async function recordClick(req) {
   const body = await readRequestJson(req);
   const title = stripTags(String(body.title || "")).slice(0, 180);
   const url = normalizeTrackedUrl(body.url);
+  const metricEvent = normalizeMetricEvent({
+    type: "link_click",
+    sourceName: body.sourceName,
+    sourceIndex: body.sourceIndex,
+  });
   if (!title || !url) {
     return { error: "Invalid click payload" };
   }
 
   if (redisConfig()) {
     try {
-      return await recordClickInRedis(title, url);
+      return await recordClickInRedis(title, url, metricEvent);
     } catch (error) {
       console.warn("Redis click tracking failed; falling back to local cache", error);
     }
@@ -524,6 +818,11 @@ async function recordClick(req) {
     };
 
     await writeClickStats(stats);
+    if (metricEvent) {
+      const metricStats = await readMetricStats(stats.date);
+      applyMetricEvent(metricStats, metricEvent);
+      await writeMetricStats(metricStats);
+    }
 
     return {
       date: stats.date,
@@ -1385,6 +1684,17 @@ async function handleRequest(req, res) {
     if (url.pathname === "/api/clicks" && req.method === "POST") {
       const data = await recordClick(req);
       sendJson(res, data, data.error ? 400 : 200);
+      return;
+    }
+
+    if (url.pathname === "/api/metrics") {
+      if (req.method === "POST") {
+        const data = await recordMetrics(req);
+        sendJson(res, data, data.error ? 400 : 200);
+        return;
+      }
+
+      sendJson(res, await metricsSummary());
       return;
     }
 
