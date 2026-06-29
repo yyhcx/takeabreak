@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="robots" content="noindex, nofollow" />
+    <title>Takeabreak Ops Dashboard</title>
+    <style>
+      body {
+        min-height: 100vh;
+        margin: 0;
+        display: grid;
+        place-items: center;
+        color: #eef5fb;
+        font-family: "Aptos", "Satoshi", "SF Pro Display", "Segoe UI", sans-serif;
+        background:
+          radial-gradient(circle at 20% 10%, rgba(85, 227, 233, 0.16), transparent 34rem),
+          linear-gradient(145deg, #071018 0%, #03080d 100%);
+      }
+
+      .loading {
+        color: #a9b6c4;
+        letter-spacing: 0.02em;
+      }
+    </style>
+  </head>
+  <body>
+    <p class="loading">Loading Takeabreak dashboard...</p>
+    <script>
+      fetch("/api/dashboard", { cache: "no-store" })
+        .then((response) => {
+          if (!response.ok) throw new Error(`Dashboard returned ${response.status}`);
+          return response.text();
+        })
+        .then((html) => {
+          document.open();
+          document.write(html);
+          document.close();
+        })
+        .catch((error) => {
+          document.body.innerHTML = `<p class="loading">Could not load dashboard: ${error.message}</p>`;
+        });
+    </script>
+  </body>
+</html>
